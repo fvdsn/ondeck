@@ -1,6 +1,6 @@
 {
   "name": "ondeck",
-  "version": "2.0.1",
+  "version": "3.0.0",
   "description": "Per-project task management for AI agents. A persistent, concurrent-safe task backlog backed by SQLite.",
   "main": "index.js",
   "bin": {
