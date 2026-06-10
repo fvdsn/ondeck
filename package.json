@@ -4,7 +4,7 @@
   "description": "Per-project task management for AI agents. A persistent, concurrent-safe task backlog backed by SQLite.",
   "main": "index.js",
   "bin": {
-    "ondeck": "./index.js"
+    "ondeck": "index.js"
   },
   "scripts": {
     "test": "node --test"
