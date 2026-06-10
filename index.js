@@ -5,7 +5,7 @@ const path = require("path");
 const { program } = require("commander");
 const Database = require("better-sqlite3");
 
-const STORE_NAME = ".smolbrain";
+const STORE_NAME = ".ondeck";
 const OPEN_STATUSES = ["todo", "wip", "blocked"];
 const MARK_STATUSES = ["todo", "wip", "blocked", "done"];
 const ALL_STATUSES = ["todo", "wip", "blocked", "done", "dropped"];
@@ -69,7 +69,7 @@ function openDb(dbPath) {
 function getDb() {
   const storePath = findStore(process.cwd());
   if (!storePath) {
-    console.error("No .smolbrain store found. Run 'smolbrain init' at your project root.");
+    console.error("No .ondeck store found. Run 'ondeck init' at your project root.");
     process.exit(1);
   }
   return openDb(storePath);
@@ -192,11 +192,11 @@ function ftsQuery(text) {
     .join(" ");
 }
 
-program.name("smolbrain").description("Per-project task management for AI agents");
+program.name("ondeck").description("Per-project task management for AI agents");
 
 program
   .command("init")
-  .description("Create a .smolbrain store in the current directory")
+  .description("Create a .ondeck store in the current directory")
   .action(() => {
     const cwd = process.cwd();
     const target = path.join(cwd, STORE_NAME);
@@ -216,7 +216,7 @@ program
       const sep = existing && !existing.endsWith("\n") ? "\n" : "";
       fs.writeFileSync(gitignore, existing + sep + line + "\n");
     }
-    console.log(`Initialized empty smolbrain store at ${target}`);
+    console.log(`Initialized empty ondeck store at ${target}`);
   });
 
 program
@@ -358,7 +358,7 @@ program
   .description(`Set task status: ${MARK_STATUSES.join(", ")}`)
   .action((id, status) => {
     if (!MARK_STATUSES.includes(status)) {
-      const hint = status === "dropped" ? " (use 'smolbrain rm' to drop a task)" : "";
+      const hint = status === "dropped" ? " (use 'ondeck rm' to drop a task)" : "";
       console.error(`Invalid status "${status}". Use: ${MARK_STATUSES.join(", ")}${hint}`);
       process.exit(1);
     }

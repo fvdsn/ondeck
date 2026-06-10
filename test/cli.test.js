@@ -8,7 +8,7 @@ const path = require("node:path");
 const CLI = path.join(__dirname, "..", "index.js");
 
 function makeTmp() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "smolbrain-"));
+  return fs.mkdtempSync(path.join(os.tmpdir(), "ondeck-"));
 }
 
 function run(cwd, args) {
@@ -29,15 +29,15 @@ test("commands fail with a hint before init", () => {
   const dir = makeTmp();
   assert.throws(
     () => run(dir, ["ls"]),
-    (err) => err.status === 1 && err.stderr.includes("smolbrain init")
+    (err) => err.status === 1 && err.stderr.includes("ondeck init")
   );
 });
 
 test("init creates the store and gitignores it", () => {
   const dir = makeTmp();
   run(dir, ["init"]);
-  assert.ok(fs.existsSync(path.join(dir, ".smolbrain")));
-  assert.match(fs.readFileSync(path.join(dir, ".gitignore"), "utf8"), /^\.smolbrain\*$/m);
+  assert.ok(fs.existsSync(path.join(dir, ".ondeck")));
+  assert.match(fs.readFileSync(path.join(dir, ".gitignore"), "utf8"), /^\.ondeck\*$/m);
   assert.throws(() => run(dir, ["init"]), (err) => err.stderr.includes("already exists"));
 });
 
@@ -46,7 +46,7 @@ test("init appends to an existing gitignore without duplicating", () => {
   fs.writeFileSync(path.join(dir, ".gitignore"), "node_modules\n");
   run(dir, ["init"]);
   const content = fs.readFileSync(path.join(dir, ".gitignore"), "utf8");
-  assert.strictEqual(content, "node_modules\n.smolbrain*\n");
+  assert.strictEqual(content, "node_modules\n.ondeck*\n");
 });
 
 test("store is discovered from a nested subdirectory", () => {
@@ -101,7 +101,7 @@ test("mark transitions and ls status filters", () => {
   assert.strictEqual(runJson(dir, ["ls"])[0].status, "wip");
 
   assert.throws(() => run(dir, ["mark", "1", "bogus"]), (err) => err.stderr.includes("Invalid status"));
-  assert.throws(() => run(dir, ["mark", "1", "dropped"]), (err) => err.stderr.includes("smolbrain rm"));
+  assert.throws(() => run(dir, ["mark", "1", "dropped"]), (err) => err.stderr.includes("ondeck rm"));
 });
 
 test("rm hides a task and restore brings it back as todo", () => {
