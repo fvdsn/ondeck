@@ -10,7 +10,7 @@ const OPEN_STATUSES = ["todo", "wip", "blocked"];
 const MARK_STATUSES = ["todo", "wip", "blocked", "done"];
 const ALL_STATUSES = ["todo", "wip", "blocked", "done", "dropped"];
 const NOW = "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')";
-const TASK_COLS = "id, created, updated, position, status, content";
+const TASK_COLS = "id, created, updated, position, status, topic, content";
 
 function findUp(startDir, name) {
   let dir = startDir;
@@ -37,6 +37,7 @@ function openDb(dbPath) {
       updated TEXT,
       position REAL NOT NULL,
       status TEXT NOT NULL DEFAULT 'todo',
+      topic TEXT,
       content TEXT NOT NULL
     );
 
@@ -45,12 +46,6 @@ function openDb(dbPath) {
       task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
       timestamp TEXT NOT NULL DEFAULT (${NOW}),
       content TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS task_tags (
-      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-      tag TEXT NOT NULL,
-      PRIMARY KEY (task_id, tag)
     );
 
     CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(content, content=tasks, content_rowid=id);
@@ -67,6 +62,18 @@ function openDb(dbPath) {
       INSERT INTO notes_fts(rowid, content) VALUES (new.id, new.content);
     END;
   `);
+  try {
+    db.exec("ALTER TABLE tasks ADD COLUMN topic TEXT");
+  } catch (_) {
+    // column already exists
+  }
+  // v2.0.x stored tags in a join table; fold them into the topic column
+  if (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_tags'").get()) {
+    db.exec(`
+      UPDATE tasks SET topic = (SELECT MIN(tag) FROM task_tags WHERE task_id = tasks.id) WHERE topic IS NULL;
+      DROP TABLE task_tags;
+    `);
+  }
   return db;
 }
 
@@ -94,38 +101,31 @@ function withTask(id, fn) {
   fn(db, task);
 }
 
-function getTags(db, taskId) {
-  return db
-    .prepare("SELECT tag FROM task_tags WHERE task_id = ? ORDER BY tag")
-    .all(taskId)
-    .map((r) => r.tag);
-}
-
 function getNotes(db, taskId) {
   return db
     .prepare("SELECT id, timestamp, content FROM notes WHERE task_id = ? ORDER BY timestamp, id")
     .all(taskId);
 }
 
-function formatTagSuffix(tags) {
-  return tags && tags.length > 0 ? ` [${tags.join(", ")}]` : "";
+function formatTopicSuffix(topic) {
+  return topic ? ` [${topic}]` : "";
 }
 
 function jsonTask(db, task, { notes = false } = {}) {
-  const out = { ...task, tags: getTags(db, task.id) };
+  const out = { ...task };
   if (notes) out.notes = getNotes(db, task.id);
   return out;
 }
 
-function printTaskLine(db, task) {
+function printTaskLine(task) {
   const lines = task.content.split("\n");
   const more = lines.length > 1 ? " [...]" : "";
-  console.log(`[${task.id}] [${task.status}]${formatTagSuffix(getTags(db, task.id))} ${lines[0]}${more}`);
+  console.log(`[${task.id}] [${task.status}]${formatTopicSuffix(task.topic)} ${lines[0]}${more}`);
 }
 
 function printTaskFull(db, task, { notes = true } = {}) {
   const dates = task.updated ? `created ${task.created}, updated ${task.updated}` : `created ${task.created}`;
-  console.log(`[${task.id}] [${task.status}]${formatTagSuffix(getTags(db, task.id))} (${dates})`);
+  console.log(`[${task.id}] [${task.status}]${formatTopicSuffix(task.topic)} (${dates})`);
   console.log(task.content);
   if (notes) {
     for (const note of getNotes(db, task.id)) {
@@ -183,11 +183,6 @@ function readInput(textParts, callback) {
   });
 }
 
-function collectTag(val, acc) {
-  acc.push(val);
-  return acc;
-}
-
 function ftsQuery(text) {
   return text
     .split(/\s+/)
@@ -228,7 +223,7 @@ program
 program
   .command("add [text...]")
   .description("Add a task at the end of the list (pass text as args or pipe via stdin)")
-  .option("-t, --tag <tag>", "Tag(s) to attach (repeatable)", collectTag, [])
+  .option("-t, --topic <topic>", "Topic the task belongs to")
   .option("--top", "Insert at the top of the list")
   .option("--after <id>", "Insert after the given task")
   .option("--json", "Output as JSON")
@@ -237,17 +232,13 @@ program
       const db = getDb();
       const position = resolvePosition(db, options);
       const { lastInsertRowid } = db
-        .prepare("INSERT INTO tasks (content, position) VALUES (?, ?)")
-        .run(text, position);
-      const insertTag = db.prepare("INSERT OR IGNORE INTO task_tags (task_id, tag) VALUES (?, ?)");
-      for (const tag of options.tag) {
-        insertTag.run(lastInsertRowid, tag);
-      }
+        .prepare("INSERT INTO tasks (content, position, topic) VALUES (?, ?, ?)")
+        .run(text, position, options.topic || null);
       const task = getTask(db, lastInsertRowid);
       if (options.json) {
         console.log(JSON.stringify(jsonTask(db, task)));
       } else {
-        printTaskLine(db, task);
+        printTaskLine(task);
       }
       db.close();
     });
@@ -256,7 +247,7 @@ program
 program
   .command("ls [status]")
   .description(`List tasks in order (default: open tasks). Status: ${ALL_STATUSES.join(", ")}`)
-  .option("-t, --tag <tag>", "Filter by tag(s) (repeatable)", collectTag, [])
+  .option("-t, --topic <topic>", "Filter by topic")
   .option("-a, --all", "Include done and dropped tasks")
   .option("--limit <n>", "Show first N results", Number)
   .option("--tail <n>", "Show last N results", Number)
@@ -273,17 +264,14 @@ program
     }
     const statuses = status ? [status] : options.all ? ALL_STATUSES : OPEN_STATUSES;
     const db = getDb();
-    const wheres = [`t.status IN (${statuses.map(() => "?").join(", ")})`];
+    const wheres = [`status IN (${statuses.map(() => "?").join(", ")})`];
     const params = [...statuses];
-    let join = "";
-    if (options.tag.length > 0) {
-      join = "JOIN task_tags tt ON t.id = tt.task_id";
-      wheres.push(`tt.tag IN (${options.tag.map(() => "?").join(", ")})`);
-      params.push(...options.tag);
+    if (options.topic) {
+      wheres.push("topic = ?");
+      params.push(options.topic);
     }
     const rows = db
-      .prepare(`SELECT DISTINCT ${TASK_COLS.replace(/(\w+)/g, "t.$1")} FROM tasks t ${join}
-        WHERE ${wheres.join(" AND ")} ORDER BY t.position, t.id`)
+      .prepare(`SELECT ${TASK_COLS} FROM tasks WHERE ${wheres.join(" AND ")} ORDER BY position, id`)
       .all(...params);
 
     const total = rows.length;
@@ -302,7 +290,7 @@ program
       console.log(JSON.stringify(sliced.map((task) => jsonTask(db, task))));
     } else {
       for (const task of sliced) {
-        printTaskLine(db, task);
+        printTaskLine(task);
       }
       const remaining = total - offset - sliced.length;
       if (remaining > 0) {
@@ -330,21 +318,24 @@ program
 program
   .command("next")
   .description("Show the first todo task in list order (advisory; use --claim to take it)")
+  .option("-t, --topic <topic>", "Only consider tasks in this topic")
   .option("--claim", "Atomically set the task to wip (safe with parallel agents)")
   .option("--json", "Output as JSON")
   .action((options) => {
     const db = getDb();
+    const topicWhere = options.topic ? "AND topic = ?" : "";
+    const params = options.topic ? [options.topic] : [];
     let task;
     if (options.claim) {
       task = db
         .prepare(`UPDATE tasks SET status = 'wip', updated = ${NOW}
-          WHERE id = (SELECT id FROM tasks WHERE status = 'todo' ORDER BY position, id LIMIT 1)
+          WHERE id = (SELECT id FROM tasks WHERE status = 'todo' ${topicWhere} ORDER BY position, id LIMIT 1)
           RETURNING ${TASK_COLS}`)
-        .get();
+        .get(...params);
     } else {
       task = db
-        .prepare(`SELECT ${TASK_COLS} FROM tasks WHERE status = 'todo' ORDER BY position, id LIMIT 1`)
-        .get();
+        .prepare(`SELECT ${TASK_COLS} FROM tasks WHERE status = 'todo' ${topicWhere} ORDER BY position, id LIMIT 1`)
+        .get(...params);
     }
     if (!task) {
       console.log(options.json ? "null" : "No todo tasks.");
@@ -429,7 +420,7 @@ program
         if (options.json) {
           console.log(JSON.stringify(jsonTask(db, updated)));
         } else {
-          printTaskLine(db, updated);
+          printTaskLine(updated);
         }
         db.close();
       });
@@ -437,9 +428,24 @@ program
   });
 
 program
-  .command("rm <id>")
-  .description("Drop a task (soft-delete; restore with 'restore')")
-  .action((id) => {
+  .command("rm [id]")
+  .description("Drop a task (soft-delete), or all open tasks in a topic with -t")
+  .option("-t, --topic <topic>", "Drop all open tasks in a topic")
+  .action((id, options) => {
+    if (!id === !options.topic) {
+      console.error("Provide a task id or --topic <topic> (not both).");
+      process.exit(1);
+    }
+    if (options.topic) {
+      const db = getDb();
+      const { changes } = db
+        .prepare(`UPDATE tasks SET status = 'dropped', updated = ${NOW}
+          WHERE topic = ? AND status IN ('todo', 'wip', 'blocked')`)
+        .run(options.topic);
+      db.close();
+      console.log(`Dropped ${changes} open task${changes === 1 ? "" : "s"} in topic [${options.topic}].`);
+      return;
+    }
     withTask(id, (db, task) => {
       if (task.status === "dropped") {
         db.close();
@@ -469,32 +475,51 @@ program
   });
 
 program
-  .command("tag <id> <tag>")
-  .description("Add a tag to a task")
-  .action((id, tag) => {
+  .command("topic <id> [name]")
+  .description("Set a task's topic, or clear it with --clear")
+  .option("--clear", "Remove the task's topic")
+  .action((id, name, options) => {
+    if (options.clear ? name : !name) {
+      console.error("Provide a topic name, or --clear to remove it (not both).");
+      process.exit(1);
+    }
     withTask(id, (db, task) => {
-      db.prepare("INSERT OR IGNORE INTO task_tags (task_id, tag) VALUES (?, ?)").run(task.id, tag);
-      const tags = getTags(db, task.id);
+      db.prepare("UPDATE tasks SET topic = ? WHERE id = ?").run(options.clear ? null : name, task.id);
       db.close();
-      console.log(`Task ${id} [${tags.join(", ")}]`);
+      console.log(options.clear ? `Task ${id} topic cleared.` : `Task ${id} is now in topic [${name}].`);
     });
   });
 
 program
-  .command("untag <id> <tag>")
-  .description("Remove a tag from a task")
-  .action((id, tag) => {
-    withTask(id, (db, task) => {
-      const changes = db.prepare("DELETE FROM task_tags WHERE task_id = ? AND tag = ?").run(task.id, tag).changes;
-      if (changes === 0) {
-        db.close();
-        console.log(`Task ${id} does not have tag "${tag}".`);
-        return;
-      }
-      const tags = getTags(db, task.id);
+  .command("topics")
+  .description("List topics with task counts per status")
+  .option("--json", "Output as JSON")
+  .action((options) => {
+    const db = getDb();
+    const rows = db
+      .prepare("SELECT topic, status, COUNT(*) AS n FROM tasks GROUP BY topic, status")
+      .all();
+    const byTopic = new Map();
+    for (const row of rows) {
+      const key = row.topic || "";
+      if (!byTopic.has(key)) byTopic.set(key, Object.fromEntries(ALL_STATUSES.map((s) => [s, 0])));
+      byTopic.get(key)[row.status] = row.n;
+    }
+    const topics = [...byTopic.keys()].sort((a, b) => (a === "") - (b === "") || a.localeCompare(b));
+    if (options.json) {
+      console.log(JSON.stringify(topics.map((t) => ({ topic: t || null, counts: byTopic.get(t) }))));
       db.close();
-      console.log(`Task ${id}${formatTagSuffix(tags)}`);
-    });
+      return;
+    }
+    if (topics.length === 0) {
+      console.log("No tasks yet.");
+    }
+    for (const t of topics) {
+      const counts = byTopic.get(t);
+      const parts = ALL_STATUSES.filter((s) => counts[s] > 0).map((s) => `${counts[s]} ${s}`);
+      console.log(`${t || "(no topic)"}: ${parts.join(", ")}`);
+    }
+    db.close();
   });
 
 program
@@ -534,7 +559,7 @@ program
       }))));
     } else {
       for (const { task, notes } of results) {
-        printTaskLine(db, task);
+        printTaskLine(task);
         for (const note of notes) {
           console.log(`  note [${note.timestamp}] ${note.content}`);
         }
@@ -577,7 +602,7 @@ program
     const openCount = OPEN_STATUSES.reduce((sum, s) => sum + counts[s], 0);
     console.log(`Tasks: ${counts.todo} todo, ${counts.wip} wip, ${counts.blocked} blocked (${openCount} open), ${counts.done} done`);
     for (const task of open) {
-      printTaskLine(db, task);
+      printTaskLine(task);
     }
     if (recentNotes.length > 0) {
       console.log("\nRecent notes:");

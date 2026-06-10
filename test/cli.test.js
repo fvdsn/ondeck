@@ -199,14 +199,58 @@ test("edit replaces content and stays findable", () => {
   assert.strictEqual(runJson(dir, ["find", "old"]).length, 0);
 });
 
-test("tags can be added, filtered on, and removed", () => {
+test("topics: set via add, filter, reassign, clear", () => {
   const dir = initDir();
-  run(dir, ["add", "a", "-t", "frontend"]);
+  run(dir, ["add", "a", "-t", "auth"]);
   run(dir, ["add", "b"]);
-  run(dir, ["tag", "2", "frontend"]);
-  assert.strictEqual(runJson(dir, ["ls", "-t", "frontend"]).length, 2);
-  run(dir, ["untag", "2", "frontend"]);
-  assert.strictEqual(runJson(dir, ["ls", "-t", "frontend"]).length, 1);
+  run(dir, ["topic", "2", "auth"]);
+  assert.strictEqual(runJson(dir, ["ls", "-t", "auth"]).length, 2);
+  run(dir, ["topic", "2", "--clear"]);
+  assert.strictEqual(runJson(dir, ["ls", "-t", "auth"]).length, 1);
+  assert.strictEqual(runJson(dir, ["get", "1"]).topic, "auth");
+  assert.strictEqual(runJson(dir, ["get", "2"]).topic, null);
+  assert.throws(() => run(dir, ["topic", "1"]), (err) => err.stderr.includes("topic name"));
+});
+
+test("topics command lists counts per status", () => {
+  const dir = initDir();
+  run(dir, ["add", "a", "-t", "auth"]);
+  run(dir, ["add", "b", "-t", "auth"]);
+  run(dir, ["add", "c"]);
+  run(dir, ["mark", "1", "done"]);
+  const topics = runJson(dir, ["topics"]);
+  const auth = topics.find((t) => t.topic === "auth");
+  assert.strictEqual(auth.counts.todo, 1);
+  assert.strictEqual(auth.counts.done, 1);
+  const none = topics.find((t) => t.topic === null);
+  assert.strictEqual(none.counts.todo, 1);
+  assert.match(run(dir, ["topics"]), /auth: 1 todo, 1 done/);
+});
+
+test("next -t scopes to a topic, including --claim", () => {
+  const dir = initDir();
+  run(dir, ["add", "other first"]);
+  run(dir, ["add", "auth first", "-t", "auth"]);
+  assert.strictEqual(runJson(dir, ["next"]).content, "other first");
+  assert.strictEqual(runJson(dir, ["next", "-t", "auth"]).content, "auth first");
+  const claimed = runJson(dir, ["next", "--claim", "-t", "auth"]);
+  assert.strictEqual(claimed.content, "auth first");
+  assert.strictEqual(claimed.status, "wip");
+  assert.strictEqual(runJson(dir, ["next", "--claim", "-t", "auth"]), null);
+  assert.strictEqual(runJson(dir, ["next"]).content, "other first");
+});
+
+test("rm -t drops all open tasks in a topic, leaving done ones", () => {
+  const dir = initDir();
+  run(dir, ["add", "a", "-t", "auth"]);
+  run(dir, ["add", "b", "-t", "auth"]);
+  run(dir, ["add", "c"]);
+  run(dir, ["mark", "1", "done"]);
+  run(dir, ["rm", "-t", "auth"]);
+  assert.strictEqual(runJson(dir, ["ls", "-t", "auth"]).length, 0);
+  assert.strictEqual(runJson(dir, ["ls", "done", "-t", "auth"]).length, 1);
+  assert.strictEqual(runJson(dir, ["ls"]).map((t) => t.content).join(), "c");
+  assert.throws(() => run(dir, ["rm"]), (err) => err.stderr.includes("task id or --topic"));
 });
 
 test("status reports counts, open tasks, and recent notes", () => {
