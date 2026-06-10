@@ -33,16 +33,34 @@ test("commands fail with a hint before init", () => {
   );
 });
 
-test("init creates the store and gitignores it", () => {
+test("init creates the store and gitignores it in a git repo", () => {
   const dir = makeTmp();
+  fs.mkdirSync(path.join(dir, ".git"));
   run(dir, ["init"]);
   assert.ok(fs.existsSync(path.join(dir, ".ondeck")));
   assert.match(fs.readFileSync(path.join(dir, ".gitignore"), "utf8"), /^\.ondeck\*$/m);
   assert.throws(() => run(dir, ["init"]), (err) => err.stderr.includes("already exists"));
 });
 
+test("init does not touch gitignore outside a git repository", () => {
+  const dir = makeTmp();
+  run(dir, ["init"]);
+  assert.ok(fs.existsSync(path.join(dir, ".ondeck")));
+  assert.ok(!fs.existsSync(path.join(dir, ".gitignore")));
+});
+
+test("init gitignores the store when .git is in a parent directory", () => {
+  const dir = makeTmp();
+  fs.mkdirSync(path.join(dir, ".git"));
+  const sub = path.join(dir, "packages", "app");
+  fs.mkdirSync(sub, { recursive: true });
+  run(sub, ["init"]);
+  assert.match(fs.readFileSync(path.join(sub, ".gitignore"), "utf8"), /^\.ondeck\*$/m);
+});
+
 test("init appends to an existing gitignore without duplicating", () => {
   const dir = makeTmp();
+  fs.mkdirSync(path.join(dir, ".git"));
   fs.writeFileSync(path.join(dir, ".gitignore"), "node_modules\n");
   run(dir, ["init"]);
   const content = fs.readFileSync(path.join(dir, ".gitignore"), "utf8");

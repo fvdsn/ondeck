@@ -12,15 +12,19 @@ const ALL_STATUSES = ["todo", "wip", "blocked", "done", "dropped"];
 const NOW = "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')";
 const TASK_COLS = "id, created, updated, position, status, content";
 
-function findStore(startDir) {
+function findUp(startDir, name) {
   let dir = startDir;
   for (;;) {
-    const candidate = path.join(dir, STORE_NAME);
+    const candidate = path.join(dir, name);
     if (fs.existsSync(candidate)) return candidate;
     const parent = path.dirname(dir);
     if (parent === dir) return null;
     dir = parent;
   }
+}
+
+function findStore(startDir) {
+  return findUp(startDir, STORE_NAME);
 }
 
 function openDb(dbPath) {
@@ -209,12 +213,14 @@ program
       console.error(`Note: a store already exists at ${ancestor}; commands in this directory will now use the new one.`);
     }
     openDb(target).close();
-    const gitignore = path.join(cwd, ".gitignore");
-    const line = `${STORE_NAME}*`;
-    const existing = fs.existsSync(gitignore) ? fs.readFileSync(gitignore, "utf8") : "";
-    if (!existing.split("\n").includes(line)) {
-      const sep = existing && !existing.endsWith("\n") ? "\n" : "";
-      fs.writeFileSync(gitignore, existing + sep + line + "\n");
+    if (findUp(cwd, ".git")) {
+      const gitignore = path.join(cwd, ".gitignore");
+      const line = `${STORE_NAME}*`;
+      const existing = fs.existsSync(gitignore) ? fs.readFileSync(gitignore, "utf8") : "";
+      if (!existing.split("\n").includes(line)) {
+        const sep = existing && !existing.endsWith("\n") ? "\n" : "";
+        fs.writeFileSync(gitignore, existing + sep + line + "\n");
+      }
     }
     console.log(`Initialized empty ondeck store at ${target}`);
   });
