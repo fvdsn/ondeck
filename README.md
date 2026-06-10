@@ -1,6 +1,8 @@
 # smolbrain
 
-Long-term memory for AI agents. A local-first CLI tool backed by SQLite with semantic search and full-text search.
+Per-project task management for AI agents. A persistent, concurrent-safe task backlog backed by SQLite.
+
+Session task lists die with the session, and `tasks.md` breaks under parallel agents and long autonomous runs. smolbrain gives agents a backlog that survives context compaction, supports atomic task claiming across parallel workers, and keeps progress notes attached to the work.
 
 ## Install
 
@@ -8,108 +10,100 @@ Long-term memory for AI agents. A local-first CLI tool backed by SQLite with sem
 npm install -g smolbrain
 ```
 
-Data is stored in `~/.local/smolbrain.sqlite`.
+## Setup
 
-## Usage
-
-### Memories
+Each project gets its own store — a `.smolbrain` SQLite file at the project root, discovered git-style by walking up from the current directory.
 
 ```bash
-# Store a memory
-smolbrain add "the deploy key is in 1password"
-smolbrain add -t ops "rotate credentials quarterly"
-echo "multi-line content" | smolbrain add
-
-# List memories
-smolbrain ls
-smolbrain ls --tail 5
-smolbrain ls -t ops
-smolbrain ls --from 2025-01-01 --to 2025-12-31
-
-# Get a specific memory
-smolbrain get 42
-
-# Semantic search (finds related memories by meaning)
-smolbrain search "how do we handle auth"
-
-# Keyword search (FTS5, exact match)
-smolbrain find "credentials"
-smolbrain find "deploy key" -t ops
-
-# Edit (archives the original, creates a new memory)
-smolbrain edit 42 "the deploy key is in vault, not 1password"
-
-# Tag management
-smolbrain tag 42 important
-smolbrain untag 42 ops
-
-# Soft-delete and restore
-smolbrain rm 42
-smolbrain restore 42
-smolbrain ls -a  # include archived
+cd my-project
+smolbrain init   # creates .smolbrain and adds it to .gitignore
 ```
+
+## Usage
 
 ### Tasks
 
 ```bash
-# Store a task (auto-tagged with 'task' and 'todo')
-smolbrain task "migrate database to v3"
+# Add tasks (they go to the end of the list)
+smolbrain add "migrate database to v3"
+smolbrain add -t backend "add retry logic to the API client"
+echo "longer task description" | smolbrain add
 
-# List tasks (default: todo and wip)
-smolbrain tasks
-smolbrain tasks done
+# Insert at a specific spot
+smolbrain add "urgent fix" --top
+smolbrain add "follow-up" --after 3
 
-# Update task status
-smolbrain mark 7 wip
-smolbrain mark 7 done
+# List open tasks (todo, wip, blocked) in order
+smolbrain ls
+smolbrain ls done
+smolbrain ls -t backend
+smolbrain ls --all
+
+# Full task with notes
+smolbrain get 3
 ```
 
-### Status
+### The work loop
 
 ```bash
-# Overview of open tasks and recent memories
+# What's the suggested next task? (first todo in list order — advisory only)
+smolbrain next
+
+# Claim it atomically (sets wip; safe with parallel agents)
+smolbrain next --claim
+
+# Record progress, findings, blockers as you work
+smolbrain note 3 "the v2 schema has a circular FK, migrating users table first"
+
+# Update status
+smolbrain mark 3 done
+smolbrain mark 4 blocked
+
+# Overview: counts, open tasks, recent notes
 smolbrain status
 ```
 
-### Pagination
+### Ordering
+
+Task order is the priority — like the implicit ordering of a `tasks.md`, but explicit and reorderable. There is no separate priority field to go stale.
 
 ```bash
-smolbrain ls --limit 10            # first 10 results
-smolbrain ls --limit 10 --offset 5 # skip 5, then show 10
-smolbrain ls --tail 10             # last 10 results
+smolbrain move 5 --top
+smolbrain move 5 --before 2
+smolbrain move 5 --after 2
+smolbrain move 5 --bottom
 ```
 
-`--limit`, `--tail`, `--offset`, `--from`, and `--to` work on `ls`, `find`, `search`, and `tasks`.
-
-### Output
-
-All listing commands support `--json` for structured output:
+### Everything else
 
 ```bash
-smolbrain ls --json
-smolbrain search "deploy" --json
-smolbrain find "deploy" --json
-smolbrain get 42 --json
+smolbrain edit 3 "rewritten task description"
+smolbrain rm 3                  # soft-delete (status: dropped)
+smolbrain restore 3             # back to todo
+smolbrain tag 3 backend
+smolbrain untag 3 backend
+smolbrain find "migration"      # FTS5 search over tasks and notes
 ```
+
+All listing commands support `--json` for structured output.
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `add [text...]` | Store a memory (args or stdin) |
-| `ls` | List memories |
-| `get <id>` | Retrieve a memory by ID |
-| `search <text>` | Semantic search (by meaning) |
-| `find <text>` | Keyword search (FTS5) |
-| `edit <id> [text...]` | Replace content (archives original) |
-| `tag <id> <tag>` | Add a tag |
-| `untag <id> <tag>` | Remove a tag |
-| `rm <id>` | Soft-delete (archive) |
-| `restore <id>` | Restore archived memory |
-| `task [text...]` | Store a task |
-| `tasks [status]` | List tasks |
-| `mark <id> <status>` | Set task status (todo/wip/done) |
-| `status` | Overview of open tasks and recent memories |
+| `init` | Create a `.smolbrain` store in the current directory |
+| `add [text...]` | Add a task (args or stdin); `--top`, `--after <id>` |
+| `ls [status]` | List tasks in order (default: open). Status: todo, wip, blocked, done, dropped |
+| `get <id>` | Show a task with full content and notes |
+| `next` | First todo in list order; `--claim` atomically sets it wip |
+| `mark <id> <status>` | Set status: todo, wip, blocked, done |
+| `note <id> [text...]` | Attach a note to a task |
+| `move <id>` | Reorder: `--top`, `--bottom`, `--before <id>`, `--after <id>` |
+| `edit <id> [text...]` | Replace task content |
+| `rm <id>` / `restore <id>` | Soft-delete / restore |
+| `tag <id> <tag>` / `untag <id> <tag>` | Tag management |
+| `find <text>` | Keyword search (FTS5) over tasks and notes |
+| `status` | Overview: counts, open tasks, recent notes |
 
 ## Claude Code skill
 
@@ -120,16 +114,14 @@ mkdir -p ~/.claude/skills/smolbrain
 cp $(npm root -g)/smolbrain/SKILL.md ~/.claude/skills/smolbrain/SKILL.md
 ```
 
-Claude will then use smolbrain to store and recall information across sessions.
-
 ## Design
 
-- **Semantic search** using all-MiniLM-L6-v2 embeddings. `search` finds memories by meaning, not just keywords.
-- **SQLite + FTS5** for storage and keyword search. No external services.
-- **Soft-delete** by default. `rm` archives, `restore` brings it back. Nothing is lost.
-- **Edit creates a new version** and archives the original. History is preserved.
-- **Tags** for flexible organization. Tasks are just memories with `task` + status tags.
-- **Single file** at `~/.local/smolbrain.sqlite`. Easy to back up, move, or inspect.
+- **Per-project store.** One `.smolbrain` SQLite file at the project root, found by walking up from cwd. No global state; tasks from different projects never mix.
+- **Position is priority.** Tasks are ordered by a fractional position; reordering never renumbers other tasks. `next` suggests the first open todo, but agents are free to scan `ls` and pick.
+- **Concurrent-safe claiming.** `next --claim` is a single atomic `UPDATE ... RETURNING`, so parallel agents (e.g. multiple worktrees) never grab the same task.
+- **Notes are the history.** Progress, findings, and blockers attach to tasks and survive context compaction. `edit` replaces content in place.
+- **Soft-delete.** `rm` sets status to `dropped`; `restore` brings it back. Nothing is lost.
+- **SQLite + FTS5.** Local-first, no services, no model downloads. Easy to back up or inspect.
 
 ## License
 

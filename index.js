@@ -2,312 +2,164 @@
 
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
 const { program } = require("commander");
 const Database = require("better-sqlite3");
 
-const DB_PATH = path.join(os.homedir(), ".local", "smolbrain.sqlite");
+const STORE_NAME = ".smolbrain";
+const OPEN_STATUSES = ["todo", "wip", "blocked"];
+const MARK_STATUSES = ["todo", "wip", "blocked", "done"];
+const ALL_STATUSES = ["todo", "wip", "blocked", "done", "dropped"];
+const NOW = "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')";
+const TASK_COLS = "id, created, updated, position, status, content";
 
-function getDb() {
-  const dir = path.dirname(DB_PATH);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+function findStore(startDir) {
+  let dir = startDir;
+  for (;;) {
+    const candidate = path.join(dir, STORE_NAME);
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
   }
-  const db = new Database(DB_PATH);
+}
+
+function openDb(dbPath) {
+  const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
   db.exec(`
-    CREATE TABLE IF NOT EXISTS memories (
+    CREATE TABLE IF NOT EXISTS tasks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+      created TEXT NOT NULL DEFAULT (${NOW}),
+      updated TEXT,
+      position REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'todo',
       content TEXT NOT NULL
-    )
-  `);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS memory_tags (
-      memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-      tag TEXT NOT NULL,
-      PRIMARY KEY (memory_id, tag)
-    )
-  `);
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, content=memories, content_rowid=id);
+    );
 
-    CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-      INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+    CREATE TABLE IF NOT EXISTS notes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      timestamp TEXT NOT NULL DEFAULT (${NOW}),
+      content TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS task_tags (
+      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      tag TEXT NOT NULL,
+      PRIMARY KEY (task_id, tag)
+    );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(content, content=tasks, content_rowid=id);
+    CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(content, content=notes, content_rowid=id);
+
+    CREATE TRIGGER IF NOT EXISTS tasks_ai AFTER INSERT ON tasks BEGIN
+      INSERT INTO tasks_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS tasks_au AFTER UPDATE OF content ON tasks BEGIN
+      INSERT INTO tasks_fts(tasks_fts, rowid, content) VALUES ('delete', old.id, old.content);
+      INSERT INTO tasks_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+      INSERT INTO notes_fts(rowid, content) VALUES (new.id, new.content);
     END;
   `);
-  try {
-    db.exec("ALTER TABLE memories ADD COLUMN embedding BLOB");
-  } catch (_) {
-    // column already exists
-  }
-  const ftsCount = db.prepare("SELECT COUNT(*) as n FROM memories_fts").get().n;
-  const memCount = db.prepare("SELECT COUNT(*) as n FROM memories").get().n;
-  if (ftsCount !== memCount) {
-    db.exec(`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`);
-  }
   return db;
 }
 
-let _pipeline = null;
-
-async function getEmbedder() {
-  if (!_pipeline) {
-    const { pipeline } = await import("@huggingface/transformers");
-    _pipeline = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", { dtype: "fp32" });
+function getDb() {
+  const storePath = findStore(process.cwd());
+  if (!storePath) {
+    console.error("No .smolbrain store found. Run 'smolbrain init' at your project root.");
+    process.exit(1);
   }
-  return _pipeline;
+  return openDb(storePath);
 }
 
-async function embed(text) {
-  const extractor = await getEmbedder();
-  const output = await extractor(text, { pooling: "mean", normalize: true });
-  return Buffer.from(output.data.buffer);
+function getTask(db, id) {
+  return db.prepare(`SELECT ${TASK_COLS} FROM tasks WHERE id = ?`).get(Number(id));
 }
 
-function cosineSimilarity(a, b) {
-  let dot = 0;
-  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-  return dot; // vectors are pre-normalized, so dot product = cosine similarity
-}
-
-async function store(text, tags) {
+function withTask(id, fn) {
   const db = getDb();
-  const { lastInsertRowid } = db
-    .prepare("INSERT INTO memories (content) VALUES (?)")
-    .run(text);
-  if (tags && tags.length > 0) {
-    const insert = db.prepare(
-      "INSERT OR IGNORE INTO memory_tags (memory_id, tag) VALUES (?, ?)"
-    );
-    for (const tag of tags) {
-      insert.run(lastInsertRowid, tag);
-    }
+  const task = getTask(db, id);
+  if (!task) {
+    db.close();
+    console.log(`No task found with id ${id}.`);
+    return;
   }
-  const buf = await embed(text);
-  db.prepare("UPDATE memories SET embedding = ? WHERE id = ?").run(buf, lastInsertRowid);
-  const row = db
-    .prepare("SELECT id, timestamp, content FROM memories WHERE id = ?")
-    .get(lastInsertRowid);
-  const allTags = getTagsForMemory(db, lastInsertRowid);
-  db.close();
-  return { row, tags: allTags };
+  fn(db, task);
 }
 
-function getTagsForMemory(db, memoryId) {
+function getTags(db, taskId) {
   return db
-    .prepare("SELECT tag FROM memory_tags WHERE memory_id = ? ORDER BY tag")
-    .all(memoryId)
+    .prepare("SELECT tag FROM task_tags WHERE task_id = ? ORDER BY tag")
+    .all(taskId)
     .map((r) => r.tag);
 }
 
-function setTaskStatus(id, newTag) {
-  const db = getDb();
-  const row = db
-    .prepare("SELECT id FROM memories WHERE id = ?")
-    .get(id);
-  if (!row) {
-    db.close();
-    console.log(`No memory found with id ${id}.`);
-    return;
-  }
-  const tags = getTagsForMemory(db, id);
-  if (!tags.includes("task")) {
-    db.close();
-    console.log(`Memory ${id} is not a task.`);
-    return;
-  }
-  db.prepare(
-    "DELETE FROM memory_tags WHERE memory_id = ? AND tag IN ('todo', 'wip', 'done')"
-  ).run(id);
-  db.prepare(
-    "INSERT OR IGNORE INTO memory_tags (memory_id, tag) VALUES (?, ?)"
-  ).run(id, newTag);
-  db.close();
-  console.log(`Task ${id} is now [${newTag}]`);
+function getNotes(db, taskId) {
+  return db
+    .prepare("SELECT id, timestamp, content FROM notes WHERE task_id = ? ORDER BY timestamp, id")
+    .all(taskId);
 }
-
-const VALID_STATUSES = ["todo", "wip", "done"];
 
 function formatTagSuffix(tags) {
   return tags && tags.length > 0 ? ` [${tags.join(", ")}]` : "";
 }
 
-function withMemory(id, fn) {
-  const db = getDb();
-  const row = db.prepare("SELECT id FROM memories WHERE id = ?").get(Number(id));
-  if (!row) {
-    db.close();
-    console.log(`No memory found with id ${id}.`);
-    return;
-  }
-  fn(db, row);
+function jsonTask(db, task, { notes = false } = {}) {
+  const out = { ...task, tags: getTags(db, task.id) };
+  if (notes) out.notes = getNotes(db, task.id);
+  return out;
 }
 
-function formatMemory(db, row) {
-  return { id: row.id, timestamp: row.timestamp, content: row.content, tags: getTagsForMemory(db, row.id) };
+function printTaskLine(db, task) {
+  const lines = task.content.split("\n");
+  const more = lines.length > 1 ? " [...]" : "";
+  console.log(`[${task.id}] [${task.status}]${formatTagSuffix(getTags(db, task.id))} ${lines[0]}${more}`);
 }
 
-function printMemory(row, tags) {
-  console.log(`[${row.id}] [${row.timestamp}]${formatTagSuffix(tags)}\n${row.content}\n`);
-}
-
-function printMemoryPreview(row, tags) {
-  const tagSuffix = formatTagSuffix(tags);
-  const lines = row.content.split("\n");
-  const preview = lines.slice(0, 3).join("\n");
-  const ellipsis = lines.length > 3 ? "\n[...]" : "";
-  console.log(`[${row.id}] [${row.timestamp}]${tagSuffix}\n${preview}${ellipsis}\n`);
-}
-
-function queryMemories(db, { joins = [], wheres = ["1=1"], params = [], limit, offset, tail } = {}) {
-  const order = tail ? "DESC" : "ASC";
-  const clauses = [];
-  const allParams = [...params];
-
-  if (limit || tail) {
-    clauses.push("LIMIT ?");
-    allParams.push(limit || tail);
-  }
-  if (offset) {
-    clauses.push("OFFSET ?");
-    allParams.push(offset);
-  }
-
-  const countSql = `SELECT COUNT(DISTINCT m.id) as total FROM memories m
-    ${joins.join(" ")}
-    WHERE ${wheres.join(" AND ")}`;
-  const total = db.prepare(countSql).get(...params).total;
-
-  const sql = `SELECT DISTINCT m.id, m.timestamp, m.content FROM memories m
-    ${joins.join(" ")}
-    WHERE ${wheres.join(" AND ")}
-    ORDER BY m.timestamp ${order}
-    ${clauses.join(" ")}`;
-
-  let rows = db.prepare(sql).all(...allParams);
-  if (tail) rows.reverse();
-  return { rows, total };
-}
-
-function printPagination(shown, total, offset) {
-  const remaining = total - (offset || 0) - shown;
-  if (remaining > 0) {
-    console.log(`(${remaining} more result${remaining === 1 ? "" : "s"} available)`);
-  }
-}
-
-function applyFilters(query, { from, to, tags, all, tagAlias = "mt" } = {}) {
-  if (tags && tags.length > 0) {
-    query.joins.push(`JOIN memory_tags ${tagAlias} ON m.id = ${tagAlias}.memory_id`);
-    query.wheres.push(`${tagAlias}.tag IN (${tags.map(() => "?").join(", ")})`);
-    query.params.push(...tags);
-  }
-  if (!all) {
-    query.wheres.push("m.id NOT IN (SELECT memory_id FROM memory_tags WHERE tag = 'archived')");
-  }
-  if (from) {
-    query.wheres.push("m.timestamp >= ?");
-    query.params.push(from);
-  }
-  if (to) {
-    query.wheres.push("m.timestamp <= ?");
-    query.params.push(to);
-  }
-}
-
-function list({ from, to, tags, all, limit, tail, offset, json } = {}) {
-  const db = getDb();
-  const query = { joins: [], wheres: ["1=1"], params: [] };
-  applyFilters(query, { from, to, tags, all });
-  if (!limit && !tail) limit = 20;
-
-  const { rows, total } = queryMemories(db, { ...query, limit, tail, offset });
-
-  if (json) {
-    console.log(JSON.stringify(rows.map((row) => formatMemory(db, row))));
-  } else {
-    for (const row of rows) {
-      const memoryTags = getTagsForMemory(db, row.id);
-      printMemory(row, memoryTags);
+function printTaskFull(db, task, { notes = true } = {}) {
+  const dates = task.updated ? `created ${task.created}, updated ${task.updated}` : `created ${task.created}`;
+  console.log(`[${task.id}] [${task.status}]${formatTagSuffix(getTags(db, task.id))} (${dates})`);
+  console.log(task.content);
+  if (notes) {
+    for (const note of getNotes(db, task.id)) {
+      console.log(`  note [${note.timestamp}] ${note.content}`);
     }
-    printPagination(rows.length, total, offset);
   }
-  db.close();
+  console.log();
 }
 
-function getById(id, { json } = {}) {
-  const db = getDb();
-  const row = db
-    .prepare("SELECT id, timestamp, content FROM memories WHERE id = ?")
-    .get(id);
-
-  if (!row) {
-    db.close();
-    console.log(`No memory found with id ${id}.`);
-    return;
-  }
-  if (json) {
-    console.log(JSON.stringify(formatMemory(db, row)));
-  } else {
-    const tags = getTagsForMemory(db, row.id);
-    printMemory(row, tags);
-  }
-  db.close();
+// Position helpers: tasks are ordered by `position` (then id). New positions
+// are midpoints so reordering never renumbers other tasks.
+function positionEdge(db, top) {
+  const fn = top ? "MIN" : "MAX";
+  const edge = db.prepare(`SELECT ${fn}(position) AS p FROM tasks`).get().p;
+  return edge == null ? 1 : top ? edge - 1 : edge + 1;
 }
 
-function find(text, { from, to, tags, all, limit, tail, offset, json } = {}) {
-  const db = getDb();
-  const ftsQuery = text.split(/\s+/).filter(Boolean).map((t) => `"${t.replace(/"/g, '""')}"`).join(" ");
-  const query = { joins: ["JOIN memories_fts ON m.id = memories_fts.rowid"], wheres: ["memories_fts MATCH ?"], params: [ftsQuery] };
-  applyFilters(query, { from, to, tags, all });
-  if (!limit && !tail) limit = 20;
-
-  const { rows, total } = queryMemories(db, { ...query, limit, tail, offset });
-
-  if (json) {
-    console.log(JSON.stringify(rows.map((row) => formatMemory(db, row))));
-    db.close();
-    return;
+function positionNextTo(db, refId, before) {
+  const ref = db.prepare("SELECT position FROM tasks WHERE id = ?").get(Number(refId));
+  if (!ref) {
+    console.error(`No task found with id ${refId}.`);
+    process.exit(1);
   }
+  const cmp = before ? "<" : ">";
+  const fn = before ? "MAX" : "MIN";
+  const neighbor = db
+    .prepare(`SELECT ${fn}(position) AS p FROM tasks WHERE position ${cmp} ?`)
+    .get(ref.position).p;
+  if (neighbor == null) return before ? ref.position - 1 : ref.position + 1;
+  return (ref.position + neighbor) / 2;
+}
 
-  const needle = text.toLowerCase();
-
-  for (const row of rows) {
-    const lines = row.content.split("\n");
-    const matchIndices = new Set();
-
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].toLowerCase().includes(needle)) {
-        for (let j = Math.max(0, i - 1); j <= Math.min(lines.length - 1, i + 2); j++) {
-          matchIndices.add(j);
-        }
-      }
-    }
-
-    const sorted = [...matchIndices].sort((a, b) => a - b);
-    const parts = [];
-    let group = [];
-
-    for (const idx of sorted) {
-      if (group.length > 0 && idx !== group[group.length - 1] + 1) {
-        parts.push(group.map((i) => lines[i]).join("\n"));
-        group = [];
-      }
-      group.push(idx);
-    }
-    if (group.length > 0) {
-      parts.push(group.map((i) => lines[i]).join("\n"));
-    }
-
-    const memoryTags = getTagsForMemory(db, row.id);
-    console.log(`[${row.id}] [${row.timestamp}]${formatTagSuffix(memoryTags)}`);
-    const prefix = sorted[0] > 0 ? "[...]\n" : "";
-    const suffix = sorted[sorted.length - 1] < lines.length - 1 ? "\n[...]\n" : "\n";
-    console.log(prefix + parts.join("\n[...]\n") + suffix);
-  }
-  printPagination(rows.length, total, offset);
-  db.close();
+function resolvePosition(db, { top, bottom, before, after }) {
+  if (top) return positionEdge(db, true);
+  if (bottom) return positionEdge(db, false);
+  if (before != null) return positionNextTo(db, before, true);
+  if (after != null) return positionNextTo(db, after, false);
+  return positionEdge(db, false);
 }
 
 function readInput(textParts, callback) {
@@ -317,348 +169,418 @@ function readInput(textParts, callback) {
   let data = "";
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", (chunk) => (data += chunk));
-  process.stdin.on("end", async () => {
+  process.stdin.on("end", () => {
     const text = data.trim();
     if (!text) {
       console.error("No input provided.");
       process.exit(1);
     }
-    await callback(text);
+    callback(text);
   });
 }
 
-function addFilterOptions(cmd) {
-  return cmd
-    .option("-t, --tag <tag>", "Filter by tag(s) (repeatable)", (val, acc) => { acc.push(val); return acc; }, [])
-    .option("--from <date>", "Start date (inclusive)")
-    .option("--to <date>", "End date (inclusive)")
-    .option("--limit <n>", "Show first N results (oldest first)", Number)
-    .option("--tail <n>", "Show last N results (chronological order)", Number)
-    .option("--offset <n>", "Skip first N results", Number)
-    .option("-a, --all", "Include archived memories")
-    .option("--json", "Output as JSON");
+function collectTag(val, acc) {
+  acc.push(val);
+  return acc;
 }
 
-function parseFilterOptions(options) {
-  if (options.limit && options.tail) {
-    console.error("Error: --limit and --tail are mutually exclusive.");
-    process.exit(1);
-  }
-  return {
-    from: options.from,
-    to: options.to,
-    tags: options.tag.length > 0 ? options.tag : undefined,
-    all: options.all,
-    limit: options.limit,
-    tail: options.tail,
-    offset: options.offset,
-    json: options.json,
-  };
+function ftsQuery(text) {
+  return text
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((t) => `"${t.replace(/"/g, '""')}"`)
+    .join(" ");
 }
 
-program.name("smolbrain").description("Long-term memory for AI agents");
+program.name("smolbrain").description("Per-project task management for AI agents");
+
+program
+  .command("init")
+  .description("Create a .smolbrain store in the current directory")
+  .action(() => {
+    const cwd = process.cwd();
+    const target = path.join(cwd, STORE_NAME);
+    if (fs.existsSync(target)) {
+      console.error(`A ${STORE_NAME} store already exists in this directory.`);
+      process.exit(1);
+    }
+    const ancestor = findStore(path.dirname(cwd));
+    if (ancestor) {
+      console.error(`Note: a store already exists at ${ancestor}; commands in this directory will now use the new one.`);
+    }
+    openDb(target).close();
+    const gitignore = path.join(cwd, ".gitignore");
+    const line = `${STORE_NAME}*`;
+    const existing = fs.existsSync(gitignore) ? fs.readFileSync(gitignore, "utf8") : "";
+    if (!existing.split("\n").includes(line)) {
+      const sep = existing && !existing.endsWith("\n") ? "\n" : "";
+      fs.writeFileSync(gitignore, existing + sep + line + "\n");
+    }
+    console.log(`Initialized empty smolbrain store at ${target}`);
+  });
 
 program
   .command("add [text...]")
-  .description("Store a memory (pass text as args or pipe via stdin)")
-  .option("-t, --tag <tag>", "Tag(s) to attach to the memory (repeatable)", (val, acc) => { acc.push(val); return acc; }, [])
+  .description("Add a task at the end of the list (pass text as args or pipe via stdin)")
+  .option("-t, --tag <tag>", "Tag(s) to attach (repeatable)", collectTag, [])
+  .option("--top", "Insert at the top of the list")
+  .option("--after <id>", "Insert after the given task")
   .option("--json", "Output as JSON")
-  .action(async (textParts, options) => {
-    readInput(textParts, async (text) => {
-      const { row, tags } = await store(text, options.tag.length > 0 ? options.tag : undefined);
-      if (options.json) {
-        console.log(JSON.stringify({ id: row.id, timestamp: row.timestamp, content: row.content, tags }));
-      } else {
-        printMemoryPreview(row, tags);
+  .action((textParts, options) => {
+    readInput(textParts, (text) => {
+      const db = getDb();
+      const position = resolvePosition(db, options);
+      const { lastInsertRowid } = db
+        .prepare("INSERT INTO tasks (content, position) VALUES (?, ?)")
+        .run(text, position);
+      const insertTag = db.prepare("INSERT OR IGNORE INTO task_tags (task_id, tag) VALUES (?, ?)");
+      for (const tag of options.tag) {
+        insertTag.run(lastInsertRowid, tag);
       }
+      const task = getTask(db, lastInsertRowid);
+      if (options.json) {
+        console.log(JSON.stringify(jsonTask(db, task)));
+      } else {
+        printTaskLine(db, task);
+      }
+      db.close();
     });
   });
 
-addFilterOptions(
-  program
-    .command("ls")
-    .description("List memories, optionally filtered by date range, tags, limit")
-).action((options) => {
-    list(parseFilterOptions(options));
+program
+  .command("ls [status]")
+  .description(`List tasks in order (default: open tasks). Status: ${ALL_STATUSES.join(", ")}`)
+  .option("-t, --tag <tag>", "Filter by tag(s) (repeatable)", collectTag, [])
+  .option("-a, --all", "Include done and dropped tasks")
+  .option("--limit <n>", "Show first N results", Number)
+  .option("--tail <n>", "Show last N results", Number)
+  .option("--offset <n>", "Skip first N results", Number)
+  .option("--json", "Output as JSON")
+  .action((status, options) => {
+    if (status && !ALL_STATUSES.includes(status)) {
+      console.error(`Invalid status "${status}". Use: ${ALL_STATUSES.join(", ")}`);
+      process.exit(1);
+    }
+    if (options.limit && options.tail) {
+      console.error("Error: --limit and --tail are mutually exclusive.");
+      process.exit(1);
+    }
+    const statuses = status ? [status] : options.all ? ALL_STATUSES : OPEN_STATUSES;
+    const db = getDb();
+    const wheres = [`t.status IN (${statuses.map(() => "?").join(", ")})`];
+    const params = [...statuses];
+    let join = "";
+    if (options.tag.length > 0) {
+      join = "JOIN task_tags tt ON t.id = tt.task_id";
+      wheres.push(`tt.tag IN (${options.tag.map(() => "?").join(", ")})`);
+      params.push(...options.tag);
+    }
+    const rows = db
+      .prepare(`SELECT DISTINCT ${TASK_COLS.replace(/(\w+)/g, "t.$1")} FROM tasks t ${join}
+        WHERE ${wheres.join(" AND ")} ORDER BY t.position, t.id`)
+      .all(...params);
+
+    const total = rows.length;
+    const offset = options.offset || 0;
+    let sliced;
+    if (options.tail) {
+      const end = total - offset;
+      sliced = rows.slice(Math.max(0, end - options.tail), Math.max(0, end));
+    } else if (options.limit) {
+      sliced = rows.slice(offset, offset + options.limit);
+    } else {
+      sliced = rows.slice(offset);
+    }
+
+    if (options.json) {
+      console.log(JSON.stringify(sliced.map((task) => jsonTask(db, task))));
+    } else {
+      for (const task of sliced) {
+        printTaskLine(db, task);
+      }
+      const remaining = total - offset - sliced.length;
+      if (remaining > 0) {
+        console.log(`(${remaining} more result${remaining === 1 ? "" : "s"} available)`);
+      }
+    }
+    db.close();
   });
 
 program
   .command("get <id>")
-  .description("Retrieve a single memory by its ID")
+  .description("Show a task with its full content and notes")
   .option("--json", "Output as JSON")
   .action((id, options) => {
-    getById(Number(id), { json: options.json });
-  });
-
-addFilterOptions(
-  program
-    .command("find <text>")
-    .description("Search memories by keyword")
-).action((text, options) => {
-    find(text, parseFilterOptions(options));
-  });
-
-program
-  .command("task [text...]")
-  .description("Store a task (automatically tagged with 'task' and 'todo')")
-  .option("-t, --tag <tag>", "Additional tag(s) (repeatable)", (val, acc) => { acc.push(val); return acc; }, [])
-  .option("--json", "Output as JSON")
-  .action(async (textParts, options) => {
-    const tags = ["task", "todo", ...options.tag];
-    readInput(textParts, async (text) => {
-      const { row, tags: allTags } = await store(text, tags);
+    withTask(id, (db, task) => {
       if (options.json) {
-        console.log(JSON.stringify({ id: row.id, timestamp: row.timestamp, content: row.content, tags: allTags }));
+        console.log(JSON.stringify(jsonTask(db, task, { notes: true })));
       } else {
-        printMemoryPreview(row, allTags);
+        printTaskFull(db, task);
       }
+      db.close();
     });
   });
 
-addFilterOptions(
-  program
-    .command("tasks [status]")
-    .description("List tasks (default: todo and wip). Status: todo, wip, done")
-).action((status, options) => {
-    const { tags, from, to, all, limit, tail, offset, json } = parseFilterOptions(options);
-    const statuses = status
-      ? [status]
-      : ["todo", "wip"];
-    if (status && !VALID_STATUSES.includes(status)) {
-      console.error(`Invalid status "${status}". Use: ${VALID_STATUSES.join(", ")}`);
-      process.exit(1);
-    }
+program
+  .command("next")
+  .description("Show the first todo task in list order (advisory; use --claim to take it)")
+  .option("--claim", "Atomically set the task to wip (safe with parallel agents)")
+  .option("--json", "Output as JSON")
+  .action((options) => {
     const db = getDb();
-    const query = {
-      joins: ["JOIN memory_tags mt1 ON m.id = mt1.memory_id"],
-      wheres: [`mt1.tag IN (${statuses.map(() => "?").join(", ")})`],
-      params: [...statuses],
-    };
-    applyFilters(query, { from, to, tags, all, tagAlias: "mt2" });
-
-    const effectiveLimit = limit || tail ? limit : 20;
-    const { rows, total } = queryMemories(db, { ...query, limit: effectiveLimit, tail, offset });
-
-    if (json) {
-      console.log(JSON.stringify(rows.map((row) => formatMemory(db, row))));
+    let task;
+    if (options.claim) {
+      task = db
+        .prepare(`UPDATE tasks SET status = 'wip', updated = ${NOW}
+          WHERE id = (SELECT id FROM tasks WHERE status = 'todo' ORDER BY position, id LIMIT 1)
+          RETURNING ${TASK_COLS}`)
+        .get();
     } else {
-      for (const row of rows) {
-        const memoryTags = getTagsForMemory(db, row.id);
-        printMemory(row, memoryTags);
-      }
-      printPagination(rows.length, total, offset);
+      task = db
+        .prepare(`SELECT ${TASK_COLS} FROM tasks WHERE status = 'todo' ORDER BY position, id LIMIT 1`)
+        .get();
+    }
+    if (!task) {
+      console.log(options.json ? "null" : "No todo tasks.");
+      db.close();
+      return;
+    }
+    if (options.json) {
+      console.log(JSON.stringify(jsonTask(db, task, { notes: true })));
+    } else {
+      printTaskFull(db, task);
     }
     db.close();
   });
 
 program
   .command("mark <id> <status>")
-  .description("Set task status: todo, wip, or done")
+  .description(`Set task status: ${MARK_STATUSES.join(", ")}`)
   .action((id, status) => {
-    if (!VALID_STATUSES.includes(status)) {
-      console.error(`Invalid status "${status}". Use: ${VALID_STATUSES.join(", ")}`);
+    if (!MARK_STATUSES.includes(status)) {
+      const hint = status === "dropped" ? " (use 'smolbrain rm' to drop a task)" : "";
+      console.error(`Invalid status "${status}". Use: ${MARK_STATUSES.join(", ")}${hint}`);
       process.exit(1);
     }
-    setTaskStatus(Number(id), status);
+    withTask(id, (db, task) => {
+      db.prepare(`UPDATE tasks SET status = ?, updated = ${NOW} WHERE id = ?`).run(status, task.id);
+      db.close();
+      console.log(`Task ${task.id} is now [${status}]`);
+    });
+  });
+
+program
+  .command("note <id> [text...]")
+  .description("Attach a note to a task (progress, findings, blockers)")
+  .option("--json", "Output as JSON")
+  .action((id, textParts, options) => {
+    readInput(textParts, (text) => {
+      withTask(id, (db, task) => {
+        const { lastInsertRowid } = db
+          .prepare("INSERT INTO notes (task_id, content) VALUES (?, ?)")
+          .run(task.id, text);
+        const note = db.prepare("SELECT id, timestamp, content FROM notes WHERE id = ?").get(lastInsertRowid);
+        db.close();
+        if (options.json) {
+          console.log(JSON.stringify({ ...note, task_id: task.id }));
+        } else {
+          console.log(`Note added to task ${task.id}.`);
+        }
+      });
+    });
+  });
+
+program
+  .command("move <id>")
+  .description("Reorder a task in the list")
+  .option("--top", "Move to the top")
+  .option("--bottom", "Move to the bottom")
+  .option("--before <id>", "Move before the given task")
+  .option("--after <id>", "Move after the given task")
+  .action((id, options) => {
+    const chosen = ["top", "bottom", "before", "after"].filter((k) => options[k] !== undefined);
+    if (chosen.length !== 1) {
+      console.error("Specify exactly one of --top, --bottom, --before <id>, --after <id>.");
+      process.exit(1);
+    }
+    withTask(id, (db, task) => {
+      const position = resolvePosition(db, options);
+      db.prepare("UPDATE tasks SET position = ? WHERE id = ?").run(position, task.id);
+      db.close();
+      console.log(`Task ${task.id} moved.`);
+    });
   });
 
 program
   .command("edit <id> [text...]")
-  .description("Replace a memory's content (archives the original)")
+  .description("Replace a task's content")
   .option("--json", "Output as JSON")
-  .action(async (id, textParts, options) => {
-    readInput(textParts, async (newText) => {
-      const db = getDb();
-      const old = db.prepare("SELECT id, timestamp, content FROM memories WHERE id = ?").get(Number(id));
-      if (!old) {
+  .action((id, textParts, options) => {
+    readInput(textParts, (text) => {
+      withTask(id, (db, task) => {
+        db.prepare(`UPDATE tasks SET content = ?, updated = ${NOW} WHERE id = ?`).run(text, task.id);
+        const updated = getTask(db, task.id);
+        if (options.json) {
+          console.log(JSON.stringify(jsonTask(db, updated)));
+        } else {
+          printTaskLine(db, updated);
+        }
         db.close();
-        console.log(`No memory found with id ${id}.`);
-        return;
-      }
-      const oldTags = getTagsForMemory(db, old.id).filter((t) => t !== "archived");
-      db.prepare("INSERT OR IGNORE INTO memory_tags (memory_id, tag) VALUES (?, 'archived')").run(old.id);
-      const { lastInsertRowid } = db.prepare("INSERT INTO memories (content) VALUES (?)").run(newText);
-      const insertTag = db.prepare("INSERT OR IGNORE INTO memory_tags (memory_id, tag) VALUES (?, ?)");
-      for (const tag of oldTags) {
-        insertTag.run(lastInsertRowid, tag);
-      }
-      const buf = await embed(newText);
-      db.prepare("UPDATE memories SET embedding = ? WHERE id = ?").run(buf, lastInsertRowid);
-      const row = db.prepare("SELECT id, timestamp, content FROM memories WHERE id = ?").get(lastInsertRowid);
-      const newTags = getTagsForMemory(db, lastInsertRowid);
-      db.close();
-      if (options.json) {
-        console.log(JSON.stringify({ id: row.id, timestamp: row.timestamp, content: row.content, tags: newTags }));
-      } else {
-        console.log(`Memory ${old.id} archived. New memory stored as ${row.id}.`);
-        printMemoryPreview(row, newTags);
-      }
-    });
-  });
-
-program
-  .command("tag <id> <tag>")
-  .description("Add a tag to a memory")
-  .action((id, tag) => {
-    withMemory(id, (db, row) => {
-      db.prepare("INSERT OR IGNORE INTO memory_tags (memory_id, tag) VALUES (?, ?)").run(row.id, tag);
-      const tags = getTagsForMemory(db, row.id);
-      db.close();
-      console.log(`Memory ${id} [${tags.join(", ")}]`);
-    });
-  });
-
-program
-  .command("untag <id> <tag>")
-  .description("Remove a tag from a memory")
-  .action((id, tag) => {
-    withMemory(id, (db, row) => {
-      const changes = db.prepare("DELETE FROM memory_tags WHERE memory_id = ? AND tag = ?").run(row.id, tag).changes;
-      if (changes === 0) {
-        db.close();
-        console.log(`Memory ${id} does not have tag "${tag}".`);
-        return;
-      }
-      const tags = getTagsForMemory(db, row.id);
-      db.close();
-      console.log(`Memory ${id}${formatTagSuffix(tags)}`);
+      });
     });
   });
 
 program
   .command("rm <id>")
-  .description("Soft-delete a memory (tag as archived)")
+  .description("Drop a task (soft-delete; restore with 'restore')")
   .action((id) => {
-    withMemory(id, (db, row) => {
-      const tags = getTagsForMemory(db, row.id);
-      if (tags.includes("archived")) {
+    withTask(id, (db, task) => {
+      if (task.status === "dropped") {
         db.close();
-        console.log(`Memory ${id} is already archived.`);
+        console.log(`Task ${id} is already dropped.`);
         return;
       }
-      db.prepare("INSERT OR IGNORE INTO memory_tags (memory_id, tag) VALUES (?, 'archived')").run(row.id);
+      db.prepare(`UPDATE tasks SET status = 'dropped', updated = ${NOW} WHERE id = ?`).run(task.id);
       db.close();
-      console.log(`Memory ${id} archived.`);
+      console.log(`Task ${id} dropped.`);
     });
   });
 
 program
   .command("restore <id>")
-  .description("Restore an archived memory")
+  .description("Restore a dropped task (back to todo)")
   .action((id) => {
-    withMemory(id, (db, row) => {
-      const tags = getTagsForMemory(db, row.id);
-      if (!tags.includes("archived")) {
+    withTask(id, (db, task) => {
+      if (task.status !== "dropped") {
         db.close();
-        console.log(`Memory ${id} is not archived.`);
+        console.log(`Task ${id} is not dropped.`);
         return;
       }
-      db.prepare("DELETE FROM memory_tags WHERE memory_id = ? AND tag = 'archived'").run(row.id);
+      db.prepare(`UPDATE tasks SET status = 'todo', updated = ${NOW} WHERE id = ?`).run(task.id);
       db.close();
-      console.log(`Memory ${id} restored.`);
+      console.log(`Task ${id} restored.`);
     });
   });
 
 program
+  .command("tag <id> <tag>")
+  .description("Add a tag to a task")
+  .action((id, tag) => {
+    withTask(id, (db, task) => {
+      db.prepare("INSERT OR IGNORE INTO task_tags (task_id, tag) VALUES (?, ?)").run(task.id, tag);
+      const tags = getTags(db, task.id);
+      db.close();
+      console.log(`Task ${id} [${tags.join(", ")}]`);
+    });
+  });
+
+program
+  .command("untag <id> <tag>")
+  .description("Remove a tag from a task")
+  .action((id, tag) => {
+    withTask(id, (db, task) => {
+      const changes = db.prepare("DELETE FROM task_tags WHERE task_id = ? AND tag = ?").run(task.id, tag).changes;
+      if (changes === 0) {
+        db.close();
+        console.log(`Task ${id} does not have tag "${tag}".`);
+        return;
+      }
+      const tags = getTags(db, task.id);
+      db.close();
+      console.log(`Task ${id}${formatTagSuffix(tags)}`);
+    });
+  });
+
+program
+  .command("find <text>")
+  .description("Search tasks and notes by keyword")
+  .option("--json", "Output as JSON")
+  .action((text, options) => {
+    const db = getDb();
+    const query = ftsQuery(text);
+    const taskHits = db
+      .prepare(`SELECT ${TASK_COLS.replace(/(\w+)/g, "t.$1")} FROM tasks t
+        JOIN tasks_fts f ON t.id = f.rowid WHERE tasks_fts MATCH ?`)
+      .all(query);
+    const noteHits = db
+      .prepare(`SELECT n.id, n.task_id, n.timestamp, n.content FROM notes n
+        JOIN notes_fts f ON n.id = f.rowid WHERE notes_fts MATCH ?`)
+      .all(query);
+
+    const byTask = new Map();
+    for (const task of taskHits) {
+      byTask.set(task.id, { task, notes: [] });
+    }
+    for (const note of noteHits) {
+      if (!byTask.has(note.task_id)) {
+        byTask.set(note.task_id, { task: getTask(db, note.task_id), notes: [] });
+      }
+      byTask.get(note.task_id).notes.push(note);
+    }
+    const results = [...byTask.values()].sort(
+      (a, b) => a.task.position - b.task.position || a.task.id - b.task.id
+    );
+
+    if (options.json) {
+      console.log(JSON.stringify(results.map(({ task, notes }) => ({
+        ...jsonTask(db, task),
+        notes: notes.map(({ id, timestamp, content }) => ({ id, timestamp, content })),
+      }))));
+    } else {
+      for (const { task, notes } of results) {
+        printTaskLine(db, task);
+        for (const note of notes) {
+          console.log(`  note [${note.timestamp}] ${note.content}`);
+        }
+      }
+      if (results.length === 0) {
+        console.log("No matches.");
+      }
+    }
+    db.close();
+  });
+
+program
   .command("status")
-  .description("Overview of open tasks and recent memories")
+  .description("Overview: counts, open tasks in order, recent notes")
   .option("--json", "Output as JSON")
   .action((options) => {
     const db = getDb();
-
-    const taskQuery = {
-      joins: ["JOIN memory_tags mt1 ON m.id = mt1.memory_id"],
-      wheres: ["mt1.tag IN ('todo', 'wip')"],
-      params: [],
-    };
-    applyFilters(taskQuery, {});
-    const { rows: tasks } = queryMemories(db, { ...taskQuery });
-
-    const recentQuery = { joins: [], wheres: ["1=1"], params: [] };
-    applyFilters(recentQuery, {});
-    const { rows: recent } = queryMemories(db, { ...recentQuery, tail: 20 });
+    const counts = Object.fromEntries(ALL_STATUSES.map((s) => [s, 0]));
+    for (const row of db.prepare("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").all()) {
+      counts[row.status] = row.n;
+    }
+    const open = db
+      .prepare(`SELECT ${TASK_COLS} FROM tasks WHERE status IN ('todo', 'wip', 'blocked') ORDER BY position, id`)
+      .all();
+    const recentNotes = db
+      .prepare(`SELECT n.id, n.task_id, n.timestamp, n.content FROM notes n
+        ORDER BY n.timestamp DESC, n.id DESC LIMIT 5`)
+      .all();
 
     if (options.json) {
       console.log(JSON.stringify({
-        tasks: tasks.map((row) => formatMemory(db, row)),
-        recent: recent.map((row) => formatMemory(db, row)),
+        counts,
+        open: open.map((task) => jsonTask(db, task)),
+        recentNotes,
       }));
       db.close();
       return;
     }
 
-    console.log(`Tasks (${tasks.length} open):`);
-    if (tasks.length === 0) {
-      console.log("  No open tasks.\n");
-    } else {
-      for (const row of tasks) {
-        const tags = getTagsForMemory(db, row.id);
-        const status = tags.find((t) => VALID_STATUSES.includes(t)) || "todo";
-        const otherTags = tags.filter((t) => !VALID_STATUSES.includes(t) && t !== "task");
-        const firstLine = row.content.split("\n")[0];
-        console.log(`  [${row.id}] [${status}]${formatTagSuffix(otherTags)} ${firstLine}`);
+    const openCount = OPEN_STATUSES.reduce((sum, s) => sum + counts[s], 0);
+    console.log(`Tasks: ${counts.todo} todo, ${counts.wip} wip, ${counts.blocked} blocked (${openCount} open), ${counts.done} done`);
+    for (const task of open) {
+      printTaskLine(db, task);
+    }
+    if (recentNotes.length > 0) {
+      console.log("\nRecent notes:");
+      for (const note of recentNotes) {
+        const firstLine = note.content.split("\n")[0];
+        console.log(`  [task ${note.task_id}] [${note.timestamp}] ${firstLine}`);
       }
-      console.log();
     }
-
-    console.log("Recent:");
-    for (const row of recent) {
-      const tags = getTagsForMemory(db, row.id);
-      const firstLine = row.content.split("\n")[0];
-      console.log(`  [${row.id}]${formatTagSuffix(tags)} ${firstLine}`);
-    }
-
     db.close();
   });
-
-async function search(text, { from, to, tags, all, limit, tail, offset, json } = {}) {
-  const queryBuf = await embed(text);
-  const queryVec = new Float32Array(queryBuf.buffer, queryBuf.byteOffset, queryBuf.byteLength / 4);
-  const db = getDb();
-  const query = { joins: [], wheres: ["m.embedding IS NOT NULL"], params: [] };
-  applyFilters(query, { from, to, tags, all });
-  const sql = `SELECT m.id, m.timestamp, m.content, m.embedding FROM memories m
-    ${query.joins.join(" ")}
-    WHERE ${query.wheres.join(" AND ")}`;
-  const rows = db.prepare(sql).all(...query.params);
-  const scored = rows.map((row) => {
-    const vec = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
-    return { id: row.id, timestamp: row.timestamp, content: row.content, similarity: cosineSimilarity(queryVec, vec) };
-  });
-  scored.sort((a, b) => b.similarity - a.similarity);
-  const effectiveOffset = offset || 0;
-  const count = limit || tail || 10;
-  const sliced = tail
-    ? scored.slice(Math.max(0, scored.length - effectiveOffset - count), scored.length - effectiveOffset).reverse()
-    : scored.slice(effectiveOffset, effectiveOffset + count);
-  const total = scored.length;
-  if (json) {
-    console.log(JSON.stringify(sliced.map((r) => ({
-      ...r,
-      tags: getTagsForMemory(db, r.id),
-      similarity: Math.round(r.similarity * 1000) / 1000,
-    }))));
-  } else {
-    for (const r of sliced) {
-      const tags = getTagsForMemory(db, r.id);
-      const sim = Math.round(r.similarity * 1000) / 1000;
-      const lines = r.content.split("\n");
-      const preview = lines.slice(0, 3).join("\n");
-      const ellipsis = lines.length > 3 ? "\n[...]" : "";
-      console.log(`[${r.id}] [${r.timestamp}]${formatTagSuffix(tags)} (${sim})\n${preview}${ellipsis}\n`);
-    }
-    printPagination(sliced.length, total, effectiveOffset);
-  }
-  db.close();
-}
-
-addFilterOptions(
-  program
-    .command("search <text>")
-    .description("Search memories by meaning (semantic search)")
-).action(async (text, options) => {
-    await search(text, parseFilterOptions(options));
-  });
-
 
 program.parse();

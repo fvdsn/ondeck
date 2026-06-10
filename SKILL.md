@@ -1,124 +1,68 @@
 ---
 name: smolbrain
-description: Long-term memory store. Use to remember information across sessions, search past memories, and manage tasks. Use when you need to save something for later, recall previous context, or track work items.
+description: Per-project task backlog for implementation work. Use to track tasks across sessions, pick the next task to work on, and record progress notes, findings, and blockers. Use at session start, when starting/finishing a task, or when discovering something worth keeping.
 allowed-tools: Bash(smolbrain *)
 ---
 
-# smolbrain - Long-term memory
+# smolbrain - Project task backlog
 
-A local SQLite-backed memory store with semantic and full-text search. Use it to persist information across sessions.
+A per-project, SQLite-backed task list that survives across sessions and context compaction. The store is a `.smolbrain` file at the project root, discovered automatically from any subdirectory. If no store exists, run `smolbrain init` at the project root (ask the user first).
 
-## When to use
+## The work loop
 
-- **Status**: at the start of a session, run `smolbrain status` to see open tasks and recent memories
-- **Store**: when you learn something worth remembering (decisions, preferences, project context, debugging findings)
-- **Search**: when you need to recall prior context before starting work
-- **Tasks**: when tracking work items across sessions
+1. **Session start** — `smolbrain status` to see open tasks and recent notes.
+2. **Pick work** — `smolbrain next` shows the suggested next task (first todo in list order). It is advisory: scan `smolbrain ls` and pick a different task if it makes more sense. When running alongside parallel agents, use `smolbrain next --claim` to atomically take the task.
+3. **While working** — `smolbrain note <id> "..."` immediately when you make a decision, discover something, or hit a blocker. If the context were lost right now, would you lose important information? If yes, write a note.
+4. **Finish** — `smolbrain mark <id> done`. Add any follow-up work you discovered with `smolbrain add`.
 
 ## Commands
 
-### Status
-
 ```bash
-# Overview of open tasks and recent memories
+# Overview: counts, open tasks in order, recent notes
 smolbrain status
+
+# Add tasks (end of list by default; order = priority)
+smolbrain add "migrate database to v3"
+smolbrain add "urgent fix" --top
+smolbrain add "follow-up" --after 3
+echo "longer description" | smolbrain add
+
+# List and inspect
+smolbrain ls               # open tasks (todo, wip, blocked) in order
+smolbrain ls done
+smolbrain get 3            # full content + notes
+
+# Work loop
+smolbrain next             # suggested next task (advisory)
+smolbrain next --claim     # atomically take it (parallel-safe)
+smolbrain mark 3 wip
+smolbrain mark 3 done
+smolbrain mark 3 blocked
+smolbrain note 3 "found circular FK; migrating users first"
+
+# Reorder (task order is the priority list)
+smolbrain move 5 --top
+smolbrain move 5 --before 2
+
+# Edit, drop, restore, tags
+smolbrain edit 3 "rewritten description"
+smolbrain rm 3             # soft-delete
+smolbrain restore 3
+smolbrain tag 3 backend
+smolbrain ls -t backend
+
+# Keyword search over tasks and notes
+smolbrain find "migration"
 ```
 
-### Store and retrieve
-
-```bash
-# Store a memory (use tags to organize)
-smolbrain add "the auth service uses JWT with RS256"
-smolbrain add -t project-x "deploy requires VPN access"
-
-# Pipe longer content
-echo "detailed notes here" | smolbrain add -t meeting
-
-# Semantic search (finds related memories by meaning)
-smolbrain search "how do we handle auth"
-smolbrain search "deploy process" -t project-x
-
-# Keyword search (FTS5, exact match)
-smolbrain find "auth"
-smolbrain find "deploy" -t project-x
-
-# List recent memories
-smolbrain ls --tail 10
-
-# Get a specific memory
-smolbrain get 42
-```
-
-### Edit and organize
-
-```bash
-# Edit (archives original, creates new memory with same tags)
-smolbrain edit 42 "corrected information"
-
-# Tag management
-smolbrain tag 42 important
-smolbrain untag 42 outdated
-
-# Soft-delete and restore
-smolbrain rm 42
-smolbrain restore 42
-```
-
-### Tasks
-
-```bash
-# Create a task
-smolbrain task "migrate database to v3"
-
-# List tasks (default: todo + wip)
-smolbrain tasks
-smolbrain tasks done
-
-# Update status
-smolbrain mark 7 wip
-smolbrain mark 7 done
-```
-
-### Pagination
-
-```bash
-smolbrain ls --limit 10            # first 10 results
-smolbrain ls --limit 10 --offset 5 # skip 5, then show 10
-smolbrain ls --tail 10             # last 10 results
-```
-
-`--limit`, `--tail`, `--offset`, `--from`, and `--to` work on `ls`, `find`, `search`, and `tasks`.
-
-### Structured output
-
-All listing commands support `--json` for structured output:
-
-```bash
-smolbrain search "auth" --json
-smolbrain find "auth" --json
-smolbrain ls --tail 5 --json
-```
+All listing commands support `--json` for structured output.
 
 ## Guidelines
 
-### Saving memories (important!)
-
-Do NOT wait until the end of a session to save memories. Save as you go, immediately after:
-
-- **Completing a task or subtask** — what was done, what changed
-- **Making a decision** — what was chosen and why
-- **Discovering something** — a bug, a pattern, how something works
-- **Hitting a blocker** — what went wrong, what was tried
-- **Committing code** — summarize the changes
-
-If the context were lost right now, would you lose important information? If yes, save a memory.
-
-### General
-
-- Run `smolbrain status` at the start of each session
-- Prefer `search` over `find` — it understands meaning, not just keywords
-- Search before storing to avoid duplicates
-- Use tags consistently to group related memories
-- Prefer short, factual memories over long narratives
-- Use `--json` when you need to process the output programmatically
-- Archived memories are hidden by default; use `-a` to include them
+- Run `smolbrain status` at the start of each session before deciding what to do.
+- Write notes as you go, not at the end — after completing a step, making a decision, discovering how something works, or hitting a blocker. Notes are how the next session (or a compacted you) recovers context.
+- Keep task content short and actionable; put details and evolving context in notes.
+- List order is the priority. If priorities shift, reorder with `move` rather than adding priority markers to task text.
+- Mark a task `wip` when you start it and `done` immediately when it's finished. Use `blocked` with a note explaining the blocker.
+- Before adding a task, check `smolbrain ls` to avoid duplicates.
+- Use `--json` when you need to process output programmatically.

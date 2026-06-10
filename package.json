@@ -1,23 +1,23 @@
 {
   "name": "smolbrain",
-  "version": "1.2.1",
-  "description": "Long-term memory for AI agents. Local-first CLI backed by SQLite with semantic and full-text search.",
+  "version": "2.0.0",
+  "description": "Per-project task management for AI agents. A persistent, concurrent-safe task backlog backed by SQLite.",
   "main": "index.js",
   "bin": {
     "smolbrain": "./index.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test"
   },
   "keywords": [
     "ai",
-    "memory",
     "agent",
+    "tasks",
+    "todo",
+    "backlog",
     "cli",
     "sqlite",
-    "fts5",
-    "embeddings",
-    "semantic-search"
+    "fts5"
   ],
   "author": "fvdsn",
   "license": "ISC",
@@ -32,7 +32,6 @@
     "SKILL.md"
   ],
   "dependencies": {
-    "@huggingface/transformers": "^3.8.1",
     "better-sqlite3": "^12.6.2",
     "commander": "^14.0.2"
   }
