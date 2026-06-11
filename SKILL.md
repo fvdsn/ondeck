@@ -12,7 +12,7 @@ A per-project, SQLite-backed task list that survives across sessions and context
 
 1. **Session start** — `ondeck status` for open tasks and recent notes; `ondeck topics` to see the streams of work.
 2. **Pick work** — `ondeck next` shows the suggested next task (first todo in list order); scope it with `-t <topic>` when working a topic. It is advisory: scan `ondeck ls` and pick a different task if it makes more sense. When running alongside parallel agents, use `ondeck next --claim` to atomically take the task.
-3. **While working** — `ondeck note <id> "..."` immediately when you make a decision, discover something, or hit a blocker. If the context were lost right now, would you lose important information? If yes, write a note.
+3. **While working** — `ondeck note <id> '...'` immediately when you make a decision, discover something, or hit a blocker. If the context were lost right now, would you lose important information? If yes, write a note.
 4. **Finish** — `ondeck mark <id> done`. Add any follow-up work you discovered with `ondeck add`.
 
 ## Topics
@@ -50,7 +50,7 @@ ondeck next -t auth-refactor --claim   # atomically take it (parallel-safe)
 ondeck mark 3 wip
 ondeck mark 3 done
 ondeck mark 3 blocked
-ondeck note 3 "found circular FK; migrating users first"
+ondeck note 3 'found circular FK; migrating users first'
 
 # Reorder (task order is the priority list)
 ondeck move 5 --top
@@ -74,6 +74,7 @@ All listing commands support `--json` for structured output.
 
 - Run `ondeck status` at the start of each session before deciding what to do.
 - Write notes as you go, not at the end — after completing a step, making a decision, discovering how something works, or hitting a blocker. Notes are how the next session (or a compacted you) recovers context.
+- Single-quote note and task text. In double quotes the shell command-substitutes backticks and `$()`, so prose mentioning a command in backticks gets that command *executed* and its text silently stripped from the saved note. Use single quotes (write `'\''` for a literal apostrophe), or pipe longer text via stdin: `echo '...' | ondeck add`.
 - Keep task content short and actionable; put details and evolving context in notes.
 - List order is the priority. If priorities shift, reorder with `move` rather than adding priority markers to task text.
 - Mark a task `wip` when you start it and `done` immediately when it's finished. Use `blocked` with a note explaining the blocker.
